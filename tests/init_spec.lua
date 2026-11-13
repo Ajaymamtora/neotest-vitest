@@ -295,6 +295,7 @@ describe("build_spec", function()
       "--outputFile=/tmp/foo.json",
       "--testNamePattern=.*",
       real("spec/basic.test.ts"),
+      "--exclude=**/basic.test.ts?*",
       "--watch=false",
     }
     assert.is.same(expected_command, spec.command)
@@ -319,6 +320,7 @@ describe("build_spec", function()
       "--outputFile=/tmp/foo.json",
       "--testNamePattern=.*",
       real("spec/basic.test.ts"),
+      "--exclude=**/basic.test.ts?*",
     }
     assert.is.same(expected_command, spec.command)
     assert.is.falsy(vim.list_contains(spec.command, "--watch=false"))
@@ -356,6 +358,7 @@ describe("build_spec", function()
       "--outputFile=/tmp/foo.json",
       "--testNamePattern=^\\s?describe\\sarrow\\sfunction\\s(?:>\\s)?",
       real("spec/basic.test.ts"),
+      "--exclude=**/basic.test.ts?*",
       "--watch=false",
     }
     assert.is.same(expected_command, spec.command)
@@ -381,6 +384,7 @@ describe("build_spec", function()
       "--outputFile=/tmp/foo.json",
       "--testNamePattern=^\\s?1$",
       real("spec/config/vite/basic.test.ts"),
+      "--exclude=**/basic.test.ts?*",
       "--watch=false",
     }
     assert.is.same(expected_command, spec.command)
@@ -406,6 +410,7 @@ describe("build_spec", function()
       "--outputFile=/tmp/foo.json",
       "--testNamePattern=^\\s?1$",
       real("spec/config/vitest/basic.test.ts"),
+      "--exclude=**/basic.test.ts?*",
       "--watch=false",
     }
     assert.is.same(expected_command, spec.command)
@@ -492,6 +497,31 @@ describe("build_spec runtime", function()
     assert.are.equal(root, spec.cwd)
     assert.is_nil(spec.strategy)
     assert.is_nil(spec.stream)
+  end)
+
+  async.it("excludes substring siblings for file and nearest Run and Debug", function()
+    local adapter = require("neotest-vitest")({})
+    local path = root .. "/src/nested.test.ts"
+    local tree = tree_for(path)
+    local nearest = tree:children()[1]:children()[1]:children()[1]
+    for _, selected in ipairs({ tree, nearest }) do
+      for _, strategy in ipairs({ "integrated", "dap" }) do
+        local spec = adapter.build_spec({ tree = selected, strategy = strategy })
+        local exclusion = "--exclude=**/nested.test.ts?*"
+        assert.contains(spec.command, exclusion)
+        if strategy == "dap" then
+          assert.contains(spec.strategy.args, exclusion)
+        end
+      end
+    end
+  end)
+
+  async.it("escapes literal glob punctuation in the selected path", function()
+    local adapter = require("neotest-vitest")({})
+    local path = root .. "/src/a[1].test.ts"
+    vim.uv.fs_copyfile(root .. "/src/nested.test.ts", path)
+    local spec = adapter.build_spec({ tree = tree_for(path) })
+    assert.contains(spec.command, "--exclude=**/a\\[1\\].test.ts?*")
   end)
 
   async.it("selects a directory without matching sibling prefixes", function()
