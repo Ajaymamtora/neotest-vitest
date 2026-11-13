@@ -368,7 +368,16 @@ function adapter.build_spec(args)
   })
   local testNamePattern = pattern.build(selection_names(tree), pos.type, major) or ".*"
   table.insert(command, "--testNamePattern=" .. testNamePattern)
-  table.insert(command, path_filter(pos))
+  local selected_path = path_filter(pos)
+  table.insert(command, selected_path)
+  if pos.type ~= "dir" then
+    -- CLI file filters are substrings, not exact filenames. Without this
+    -- exclusion, selecting foo.test.ts also executes foo.test.tsx.
+    -- Vitest 1 matches exclusions against relative paths; later releases also
+    -- match absolute paths. A basename glob works with either root convention.
+    local literal_name = vim.fn.fnamemodify(selected_path, ":t"):gsub("([*?%[%]{}()!+@])", "\\%1")
+    table.insert(command, "--exclude=**/" .. literal_name .. "?*")
+  end
 
   vim.list_extend(command, args.extra_args or {})
 
