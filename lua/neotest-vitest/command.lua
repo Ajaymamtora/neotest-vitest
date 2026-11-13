@@ -240,7 +240,10 @@ function M.dap_config(command, entry)
     name = "Debug Vitest tests",
     type = "pwa-node",
     request = "launch",
-    console = "integratedTerminal",
+    -- Route the debuggee's stdout/stderr through DAP output events so
+    -- Neotest's output panel shows Vitest's own messages for debug runs.
+    console = "internalConsole",
+    outputCapture = "std",
     internalConsoleOptions = "neverOpen",
     autoAttachChildProcesses = true,
     sourceMaps = true,

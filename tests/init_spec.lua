@@ -583,4 +583,47 @@ describe("build_spec runtime", function()
     assert.are.equal("passed", results[test:data().id].status)
     assert.is_nil(vim.uv.fs_stat(spec.context.results_path))
   end)
+
+  async.it("ignores the DAP strategy's placeholder exit code but not unhandled errors", function()
+    local adapter = require("neotest-vitest")({})
+    local tree = tree_for(root .. "/src/nested.test.ts")
+    local test = tree:children()[1]:children()[1]:children()[1]
+    local green = vim.json.encode({
+      success = true,
+      testResults = {
+        {
+          name = root .. "/src/nested.test.ts",
+          status = "passed",
+          assertionResults = {
+            {
+              ancestorTitles = { "first level", "second level" },
+              title = "foo",
+              status = "passed",
+              failureMessages = {},
+            },
+          },
+        },
+      },
+    })
+    local output = vim.fn.tempname()
+    local function run(strategy, log)
+      local spec = adapter.build_spec({ tree = test, strategy = strategy })
+      vim.fn.writefile({ green }, spec.context.results_path)
+      vim.fn.writefile(vim.split(log, "\n"), output)
+      return adapter.results(spec, { code = 1, output = output }, test)[test:data().id]
+    end
+
+    -- js-debug sends no exited event, so Neotest reports 1 for a clean run.
+    local debugged = run(
+      "dap",
+      "JSON report written\n[neotest] DAP session ended without an event_exited exitCode"
+    )
+    assert.are.equal("passed", debugged.status)
+    -- Unhandled errors still fail an all-green debug run.
+    local unhandled = run("dap", "Vitest caught 1 unhandled error during the test run.")
+    assert.are.equal("failed", unhandled.status)
+    assert.is_truthy(unhandled.short:find("exited with code 1", 1, true))
+    -- Without a debugger the process exit code stays authoritative.
+    assert.are.equal("failed", run(nil, "").status)
+  end)
 end)

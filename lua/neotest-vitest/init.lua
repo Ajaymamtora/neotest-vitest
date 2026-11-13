@@ -393,7 +393,7 @@ function adapter.build_spec(args)
 
   local cwd = getCwd(pos.path)
 
-  local context = { results_path = results_path, file = pos.path }
+  local context = { results_path = results_path, file = pos.path, debug = args.strategy == "dap" }
   local stream
   if command_util.watches(command) then
     -- Watch mode never exits; Vitest rewrites the JSON report after every
@@ -426,6 +426,27 @@ function adapter.build_spec(args)
   }
 end
 
+-- Vitest prints this banner (v1+) when unhandled errors fail a run whose
+-- tests all passed; the JSON report's `success` flag does not include them.
+local UNHANDLED_BANNER = "Vitest caught %d+ unhandled error"
+
+---Neotest's DAP strategy returns exit code 1 whenever the debug adapter
+---sends no `exited` event, which js-debug does not for launched Node
+---programs. That code carries no information about the debuggee, so for
+---debug runs derive a failing exit only from Vitest's own output.
+---@async
+---@param spec neotest.RunSpec
+---@param result neotest.StrategyResult|nil
+---@return { code?: integer, output?: string }|nil
+local function debug_process(spec, result)
+  if not (spec.context and spec.context.debug and result and result.code == 1) then
+    return result
+  end
+  local ok, output = pcall(lib.files.read, result.output)
+  local unhandled = ok and type(output) == "string" and output:find(UNHANDLED_BANNER) ~= nil
+  return { output = result.output, code = unhandled and 1 or nil }
+end
+
 ---@async
 ---@param spec neotest.RunSpec
 ---@param result neotest.StrategyResult
@@ -450,7 +471,7 @@ function adapter.results(spec, result, tree)
     logger.error("neotest-vitest:", err, results_path)
     return report.fail_all(tree, err, result and result.output)
   end
-  return report.to_results(parsed, tree, result)
+  return report.to_results(parsed, tree, debug_process(spec, result))
 end
 
 local defaults = {
