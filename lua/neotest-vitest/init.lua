@@ -3,11 +3,14 @@ local async = require("neotest.async")
 local lib = require("neotest.lib")
 local logger = require("neotest.logging")
 local util = require("neotest-vitest.util")
+local command_util = require("neotest-vitest.command")
+local pattern = require("neotest-vitest.pattern")
+local report = require("neotest-vitest.report")
 
 ---@class neotest.VitestOptions
----@field vitestCommand? string|fun(): string
+---@field vitestCommand? string|string[]|fun(path: string): string|string[] argv list, executable path or legacy command string
 ---@field vitestConfigFile? string|fun(): string
----@field env? table<string, string>|fun(): table<string, string>
+---@field env? table<string, string>|fun(spec_env: table<string, string>): table<string, string>
 ---@field cwd? string|fun(): string
 ---@field filter_dir? fun(name: string, relpath: string, root: string): boolean
 ---@field is_test_file? fun(file_path: string): boolean
@@ -110,159 +113,187 @@ function adapter.is_test_file(file_path)
   return is_test_file and hasVitestDependency(file_path)
 end
 
+local callee_shapes = {
+  "(identifier) @func_name",
+  "(member_expression object: (identifier) @func_name)",
+  "(member_expression object: (member_expression object: (identifier) @func_name))",
+}
+
+local function build_query()
+  -- `describe("x", fn)`, `describe.skip("x", fn)`, `describe.concurrent.skip("x", fn)`
+  -- and their curried forms `describe.each(table)("x", fn)`,
+  -- `describe.for(table)("x", fn)`, `describe.skipIf(cond)("x", fn)` and
+  -- tagged-template tables. The title may be a string or template literal.
+  -- Every shape is a separate pattern: Neotest needs matches in document
+  -- order, which alternations inside a pattern do not preserve.
+  local query = {}
+  for _, entry in ipairs({
+    { kind = "namespace", names = '"describe" "suite"', curried = '"describe" "suite" "layer"' },
+    { kind = "test", names = '"it" "test"', curried = '"it" "test"' },
+  }) do
+    for _, title in ipairs({ "string", "template_string" }) do
+      for _, fn in ipairs({ "arrow_function", "function_expression" }) do
+        local args = ("arguments: (arguments . (%s) @%s.name (%s))"):format(title, entry.kind, fn)
+        for _, callee in ipairs(callee_shapes) do
+          query[#query + 1] = ("((call_expression function: %s %s) (#any-of? @func_name %s)) @%s.definition"):format(
+            callee,
+            args,
+            entry.names,
+            entry.kind
+          )
+          query[#query + 1] = ("((call_expression function: (call_expression function: %s) %s) (#any-of? @func_name %s)) @%s.definition"):format(
+            callee,
+            args,
+            entry.curried,
+            entry.kind
+          )
+        end
+      end
+    end
+  end
+  return table.concat(query, "\n")
+end
+
+local discovery_query = build_query()
+
+local escapes = { n = "\n", t = "\t", r = "\r", b = "\b", f = "\f", v = "\v", ["0"] = "\0" }
+
+local function utf8_char(code)
+  local ok, char = pcall(vim.fn.nr2char, code, 1)
+  return ok and char or ""
+end
+
+---@param text string source text of a string or template literal title
+---@return string
+local function unquote(text)
+  local body = text:sub(2, -2)
+  local out, i = {}, 1
+  while i <= #body do
+    local char = body:sub(i, i)
+    if char ~= "\\" then
+      out[#out + 1] = char
+      i = i + 1
+    else
+      local next_char = body:sub(i + 1, i + 1)
+      local hex = next_char == "x" and body:match("^%x%x", i + 2)
+      local unicode = next_char == "u" and body:match("^%x%x%x%x", i + 2)
+      local braced = next_char == "u" and body:match("^{(%x+)}", i + 2)
+      if hex then
+        out[#out + 1] = utf8_char(tonumber(hex, 16))
+        i = i + 4
+      elseif braced then
+        out[#out + 1] = utf8_char(tonumber(braced, 16))
+        i = i + 4 + #braced
+      elseif unicode then
+        out[#out + 1] = utf8_char(tonumber(unicode, 16))
+        i = i + 6
+      elseif next_char == "\n" then
+        -- Line continuation.
+        i = i + 2
+      else
+        out[#out + 1] = escapes[next_char] or next_char
+        i = i + 2
+      end
+    end
+  end
+  return table.concat(out)
+end
+
+--- Build Neotest positions for discovery. Referenced by name so that it also
+--- works when Neotest parses files in a subprocess.
+function adapter._build_position(file_path, source, captured_nodes)
+  local kind = captured_nodes["test.name"] and "test"
+    or captured_nodes["namespace.name"] and "namespace"
+  if not kind then
+    return nil
+  end
+  local name_node = captured_nodes[kind .. ".name"]
+  local definition = captured_nodes[kind .. ".definition"]
+  local parameterized = false
+  local callee = definition:field("function")[1]
+  if callee and callee:type() == "call_expression" then
+    local inner = callee:field("function")[1]
+    if inner and inner:type() == "member_expression" then
+      local property = inner:field("property")[1]
+      local property_name = property and vim.treesitter.get_node_text(property, source)
+      parameterized = property_name == "each" or property_name == "for"
+    end
+  end
+  if name_node:type() == "template_string" then
+    for child in name_node:iter_children() do
+      if child:type() == "template_substitution" then
+        -- Runtime text is unknown; every substitution is a wildcard.
+        parameterized = true
+      end
+    end
+  end
+  return {
+    type = kind,
+    path = file_path,
+    name = unquote(vim.treesitter.get_node_text(name_node, source)),
+    range = { definition:range() },
+    is_parameterized = parameterized,
+  }
+end
+
 ---@async
 ---@return neotest.Tree | nil
 function adapter.discover_positions(path)
-  local query = [[
-    ; -- Namespaces --
-    ; Matches: `describe('context')`
-    ((call_expression
-      function: (identifier) @func_name (#eq? @func_name "describe")
-      arguments: (arguments (string (string_fragment) @namespace.name) (arrow_function))
-    )) @namespace.definition
-    ; Matches: `describe.only('context')`
-    ((call_expression
-      function: (member_expression
-        object: (identifier) @func_name (#any-of? @func_name "describe")
-      )
-      arguments: (arguments (string (string_fragment) @namespace.name) (arrow_function))
-    )) @namespace.definition
-    ; Matches: `describe.each(['data'])('context')`
-    ((call_expression
-      function: (call_expression
-        function: (member_expression
-          object: (identifier) @func_name (#any-of? @func_name "describe")
-        )
-      )
-      arguments: (arguments (string (string_fragment) @namespace.name) (arrow_function))
-    )) @namespace.definition
-    ; Matches: `layer(...)('context', () => ...)` (@effect/vitest syntax)
-    ((call_expression
-      function: (call_expression
-        function: (identifier) @func_name (#eq? @func_name "layer")
-      )
-      arguments: (arguments (string (string_fragment) @namespace.name) (arrow_function))
-    )) @namespace.definition
-
-    ; -- Tests --
-    ; Matches: `test('test') / it('test')`
-    ((call_expression
-      function: (identifier) @func_name (#any-of? @func_name "it" "test")
-      arguments: (arguments (string (string_fragment) @test.name) (arrow_function))
-    )) @test.definition
-    ; Matches: `test.only('test') / it.only('test')`
-    ((call_expression
-      function: (member_expression
-        object: (identifier) @func_name (#any-of? @func_name "test" "it")
-      )
-      arguments: (arguments (string (string_fragment) @test.name) (arrow_function))
-    )) @test.definition
-    ; Matches: `test.each(['data'])('test') / it.each(['data'])('test')`
-    ((call_expression
-      function: (call_expression
-        function: (member_expression
-          object: (identifier) @func_name (#any-of? @func_name "it" "test")
-        )
-      )
-      arguments: (arguments (string (string_fragment) @test.name) (arrow_function))
-    )) @test.definition
-  ]]
-  query = query .. string.gsub(query, "arrow_function", "function_expression")
-  return lib.treesitter.parse_positions(path, query, { nested_tests = true })
+  return lib.treesitter.parse_positions(path, discovery_query, {
+    nested_tests = true,
+    build_position = 'require("neotest-vitest")._build_position',
+  })
 end
+
+local default_command = nil
 
 ---@param path string
----@return string
-local function getVitestCommand(path)
-  local rootPath = util.find_node_modules_ancestor(path)
-  local vitestBinary = util.path.join(rootPath, "node_modules", ".bin", "vitest")
-
-  if util.path.exists(vitestBinary) then
-    return vitestBinary
+---@param override? string|string[]
+---@return string[] argv
+---@return boolean owned whether this adapter chose the executable
+local function resolve_command(path, override)
+  local value = override
+  if value == nil and default_command then
+    value = default_command(path)
   end
-
-  local gitRootPath = util.find_git_ancestor(path)
-  if gitRootPath then
-    vitestBinary = util.path.join(gitRootPath, "node_modules", ".bin", "vitest")
-    if util.path.exists(vitestBinary) then
-      return vitestBinary
-    end
+  if value == nil then
+    return command_util.default_argv(path), true
   end
-
-  return "vitest"
+  local argv, err = command_util.argv(value)
+  if not argv then
+    error("neotest-vitest: " .. err, 0)
+  end
+  return argv, false
 end
 
-local vitestConfigPattern = util.root_pattern("{vite,vitest}.config.{js,ts,mjs,mts}")
+-- Ordered by config precedence (https://vitest.dev/config/#configuration)
+local configNames = {
+  "vitest.config.ts",
+  "vitest.config.mts",
+  "vitest.config.cts",
+  "vitest.config.js",
+  "vitest.config.mjs",
+  "vitest.config.cjs",
+  "vite.config.ts",
+  "vite.config.mts",
+  "vite.config.cts",
+  "vite.config.js",
+  "vite.config.mjs",
+  "vite.config.cjs",
+}
 
+---Nearest Vitest/Vite config inside the test's checkout.
 ---@param path string
 ---@return string|nil
 local function getVitestConfig(path)
-  local rootPath = vitestConfigPattern(path)
-
-  if not rootPath then
-    return nil
-  end
-
-  -- Ordered by config precedence (https://vitest.dev/config/#configuration)
-  local possibleVitestConfigNames = {
-    "vitest.config.ts",
-    "vitest.config.js",
-    "vite.config.ts",
-    "vite.config.js",
-    -- `.mts,.mjs` are sometimes needed (https://vitejs.dev/guide/migration.html#deprecate-cjs-node-api)
-    "vitest.config.mts",
-    "vitest.config.mjs",
-    "vite.config.mts",
-    "vite.config.mjs",
-  }
-
-  for _, configName in ipairs(possibleVitestConfigNames) do
-    local configPath = util.path.join(rootPath, configName)
-
-    if util.path.exists(configPath) then
-      return configPath
+  return command_util.visit_ancestors(path, function(dir)
+    for _, name in ipairs(configNames) do
+      local candidate = dir .. "/" .. name
+      if util.path.is_file(candidate) then
+        return candidate
+      end
     end
-  end
-
-  return nil
-end
-
-local function escapeTestPattern(s)
-  return (
-    s:gsub("%(", "\\(")
-      :gsub("%)", "\\)")
-      :gsub("%]", "\\]")
-      :gsub("%[", "\\[")
-      :gsub("%.", "\\.")
-      :gsub("%*", "\\*")
-      :gsub("%+", "\\+")
-      :gsub("%-", "\\-")
-      :gsub("%?", "\\?")
-      :gsub(" ", "\\s")
-      :gsub("%$", "\\$")
-      :gsub("%^", "\\^")
-      :gsub("%/", "\\/")
-  )
-end
-
-local function get_strategy_config(strategy, command, cwd)
-  local config = {
-    dap = function()
-      return {
-        name = "Debug Vitest Tests",
-        type = "pwa-node",
-        request = "launch",
-        args = { unpack(command, 2) },
-        runtimeExecutable = command[1],
-        console = "integratedTerminal",
-        internalConsoleOptions = "neverOpen",
-        cwd = cwd or "${workspaceFolder}",
-      }
-    end,
-  }
-  if config[strategy] then
-    return config[strategy]()
-  end
+  end)
 end
 
 local function getEnv(specEnv)
@@ -272,129 +303,184 @@ end
 ---@param path string
 ---@return string|nil
 local function getCwd(path)
-  return vitestConfigPattern(path) or util.find_node_modules_ancestor(path)
+  local config = getVitestConfig(path)
+  if config then
+    return vim.fs.dirname(config)
+  end
+  return command_util.visit_ancestors(path, function(dir)
+    return util.path.is_dir(dir .. "/node_modules") and dir or nil
+  end)
+end
+
+---Names from the outermost namespace down to the selected position.
+local function selection_names(tree)
+  local names = {}
+  local node = tree
+  while node and node:data().type ~= "file" and node:data().type ~= "dir" do
+    local data = node:data()
+    table.insert(names, 1, { name = data.name, parameterized = data.is_parameterized })
+    node = node:parent()
+  end
+  return names
+end
+
+---Path filter passed to Vitest. Vitest compares filters with real paths and
+---treats them as substrings, so resolve symlinks (e.g. macOS /tmp) and keep a
+---trailing separator on directories so `src` cannot select `src2`.
+local function path_filter(position)
+  local resolved =
+    vim.fs.normalize((vim.uv or vim.loop).fs_realpath(position.path) or position.path)
+  if position.type == "dir" and not resolved:match("/$") then
+    resolved = resolved .. "/"
+  end
+  return resolved
 end
 
 ---@param args neotest.RunArgs
 ---@return neotest.RunSpec | nil
 function adapter.build_spec(args)
-  local results_path = async.fn.tempname() .. ".json"
   local tree = args.tree
-
   if not tree then
     return
   end
-  local names = {}
-  while tree and tree:data().type ~= "file" and tree:data().type ~= "dir" do
-    table.insert(names, 1, tree:data().name)
-    tree = tree:parent() --[[@as neotest.Tree]]
-  end
-  -- Vitest 5 uses " > " between suites and tests; older versions use " ".
-  local testNamePattern = table.concat(vim.tbl_map(escapeTestPattern, names), "\\s(?:>\\s)?")
+  local pos = tree:data()
 
-  if #testNamePattern == 0 then
-    testNamePattern = ".*"
-  else
-    testNamePattern = "^\\s?" .. testNamePattern
+  local command, owned = resolve_command(pos.path, args.vitestCommand)
+  local entry = command_util.vitest_entry(pos.path)
+  local major = entry and command_util.vitest_major(entry) or nil
+  if not owned and not (command[1] == "node" and command[2] == entry) then
+    -- A caller-supplied command may run a different installation; only trust
+    -- the local version when it is the one being executed.
+    major = nil
   end
 
-  local pos = args.tree:data()
-  if pos.type == "test" then
-    testNamePattern = testNamePattern .. "$"
-  end
-
-  local binary = args.vitestCommand or getVitestCommand(pos.path)
-  local config = getVitestConfig(pos.path) or "vitest.config.js"
-  local command = vim.split(binary, "%s+")
-
-  if util.path.exists(config) then
+  local config = getVitestConfig(pos.path)
+  if config and util.path.exists(config) then
     -- only use config if available
     table.insert(command, "--config=" .. config)
   end
 
+  local results_path = async.fn.tempname() .. ".json"
   vim.list_extend(command, {
     "--reporter=verbose",
     "--reporter=json",
     "--outputFile=" .. results_path,
-    "--testNamePattern=" .. testNamePattern,
-    vim.fs.normalize(pos.path),
   })
+  local testNamePattern = pattern.build(selection_names(tree), pos.type, major) or ".*"
+  table.insert(command, "--testNamePattern=" .. testNamePattern)
+  table.insert(command, path_filter(pos))
 
   vim.list_extend(command, args.extra_args or {})
 
-  if
-    not vim.list_contains(command, "-w")
-    and not vim.list_contains(command, "--watch")
-    and not vim.list_contains(command, "--watch=true")
-    and not vim.list_contains(command, "--watch=false")
-  then
-    vim.list_extend(command, {
-      "--watch=false",
-    })
+  if not command_util.has_option(command, command_util.watch_options) then
+    table.insert(command, "--watch=false")
+  end
+
+  if args.strategy == "dap" then
+    -- One debuggee at a time keeps breakpoints and stepping deterministic,
+    -- and a paused breakpoint must not trip Vitest's per-test/hook timeouts.
+    -- Explicit caller options always win.
+    if not command_util.has_option(command, command_util.file_parallelism_options) then
+      table.insert(command, "--no-file-parallelism")
+    end
+    if not command_util.has_option(command, command_util.test_timeout_options) then
+      table.insert(command, "--test-timeout=0")
+    end
+    if not command_util.has_option(command, command_util.hook_timeout_options) then
+      table.insert(command, "--hook-timeout=0")
+    end
   end
 
   local cwd = getCwd(pos.path)
 
-  -- creating empty file for streaming results
-  lib.files.write(results_path, "")
-  local stream_data, stop_stream = util.stream(results_path)
+  local context = { results_path = results_path, file = pos.path, debug = args.strategy == "dap" }
+  local stream
+  if command_util.watches(command) then
+    -- Watch mode never exits; Vitest rewrites the JSON report after every
+    -- run, so stream each complete report. Single runs are read once in
+    -- `results` and need no file watcher.
+    lib.files.write(results_path, "")
+    local stream_data, stop_stream = util.stream(results_path)
+    context.stop_stream = stop_stream
+    stream = function()
+      return function()
+        local data = stream_data()
+        local ok, parsed = pcall(report.decode, data)
+        if not ok or not parsed then
+          return {}
+        end
+        return report.to_results(parsed, tree, nil, { partial = true })
+      end
+    end
+  end
 
   return {
     command = command,
     cwd = cwd,
-    context = {
-      results_path = results_path,
-      file = pos.path,
-      stop_stream = stop_stream,
-    },
-    stream = function()
-      return function()
-        local new_results = stream_data()
-
-        if not new_results or new_results == "" then
-          return {}
-        end
-
-        local ok, parsed = pcall(vim.json.decode, new_results, { luanil = { object = true } })
-
-        if not ok or not parsed.testResults then
-          return {}
-        end
-
-        return util.parsed_json_to_results(parsed, results_path, nil)
-      end
-    end,
-    strategy = get_strategy_config(args.strategy, command, cwd),
+    context = context,
+    stream = stream,
+    -- Neotest fills `env` and `cwd` from the spec (including run arguments).
+    strategy = args.strategy == "dap" and command_util.dap_config(command, owned and entry or nil)
+      or nil,
     env = getEnv(args[2] and args[2].env or {}),
   }
 end
 
+-- Vitest prints this banner (v1+) when unhandled errors fail a run whose
+-- tests all passed; the JSON report's `success` flag does not include them.
+local UNHANDLED_BANNER = "Vitest caught %d+ unhandled error"
+
+---Neotest's DAP strategy returns exit code 1 whenever the debug adapter
+---sends no `exited` event, which js-debug does not for launched Node
+---programs. That code carries no information about the debuggee, so for
+---debug runs derive a failing exit only from Vitest's own output.
 ---@async
 ---@param spec neotest.RunSpec
----@return neotest.Result[]
-function adapter.results(spec, b, tree)
-  spec.context.stop_stream()
-
-  local output_file = spec.context.results_path
-
-  local success, data = pcall(lib.files.read, output_file)
-
-  if not success then
-    logger.error("No test output file found ", output_file)
-    return {}
+---@param result neotest.StrategyResult|nil
+---@return { code?: integer, output?: string }|nil
+local function debug_process(spec, result)
+  if not (spec.context and spec.context.debug and result and result.code == 1) then
+    return result
   end
-
-  local ok, parsed = pcall(vim.json.decode, data, { luanil = { object = true } })
-
-  if not ok then
-    logger.error("Failed to parse test output json ", output_file)
-    return {}
-  end
-
-  local results = util.parsed_json_to_results(parsed, output_file, b.output)
-
-  return results
+  local ok, output = pcall(lib.files.read, result.output)
+  local unhandled = ok and type(output) == "string" and output:find(UNHANDLED_BANNER) ~= nil
+  return { output = result.output, code = unhandled and 1 or nil }
 end
+
+---@async
+---@param spec neotest.RunSpec
+---@param result neotest.StrategyResult
+---@param tree neotest.Tree
+---@return table<string, neotest.Result>
+function adapter.results(spec, result, tree)
+  local results_path = spec.context and spec.context.results_path
+  if spec.context and spec.context.stop_stream then
+    spec.context.stop_stream()
+  end
+  local parsed, err = report.read(results_path)
+  if results_path then
+    -- Report filenames are never reused; remove the consumed report so a
+    -- long session does not accumulate them.
+    pcall(os.remove, results_path)
+  end
+  if not parsed then
+    local code = result and result.code
+    if type(code) == "number" and code ~= 0 then
+      err = ("%s (Vitest exited with code %d)"):format(err, code)
+    end
+    logger.error("neotest-vitest:", err, results_path)
+    return report.fail_all(tree, err, result and result.output)
+  end
+  return report.to_results(parsed, tree, debug_process(spec, result))
+end
+
+local defaults = {
+  config = getVitestConfig,
+  env = getEnv,
+  cwd = getCwd,
+  filter_dir = adapter.filter_dir,
+  is_test_file = adapter.is_test_file,
+}
 
 local is_callable = function(obj)
   return type(obj) == "function" or (type(obj) == "table" and obj.__call)
@@ -403,11 +489,20 @@ end
 setmetatable(adapter, {
   ---@param opts neotest.VitestOptions
   __call = function(_, opts)
+    opts = opts or {}
+    -- The adapter is a module singleton: each configuration replaces the
+    -- previous one instead of inheriting options from an earlier setup.
+    default_command = nil
+    getVitestConfig, getEnv, getCwd = defaults.config, defaults.env, defaults.cwd
+    adapter.filter_dir, adapter.is_test_file = defaults.filter_dir, defaults.is_test_file
+
+    -- A string (legacy), an argv list or a function of the test path
+    -- returning either. Strings are tokenised without invoking a shell.
     if is_callable(opts.vitestCommand) then
-      getVitestCommand = opts.vitestCommand
+      default_command = opts.vitestCommand
     elseif opts.vitestCommand then
-      getVitestCommand = function()
-        return opts.vitestCommand
+      default_command = function()
+        return vim.deepcopy(opts.vitestCommand)
       end
     end
 

@@ -4,9 +4,55 @@ This plugin provides a [Vitest](https://vitest.dev/) adapter for the [Neotest](h
 
 Credits to [neotest-jest](https://github.com/haydenmeade/neotest-jest)
 
+## About this fork
+
+[Ajaymamtora/neotest-vitest](https://github.com/Ajaymamtora/neotest-vitest) is an MIT
+fork of [marilari88/neotest-vitest](https://github.com/marilari88/neotest-vitest). It
+changes how runs are built and how results are reported:
+
+- **Runner selection.** The adapter uses the nearest `node_modules/.bin/vitest` inside
+  the source file's checkout and never looks past the checkout's `.git`. When the
+  package has `node_modules/vitest/vitest.mjs`, Windows runs it with Node directly so
+  no `.cmd` shim is executed. Pass `vitestCommand` as an argv table (for example
+  `{ "pnpm", "exec", "vitest" }`) to keep it exactly as given. A string is split
+  using shell-style quoting, but no shell ever runs it.
+- **Version-aware filters.** The `--testNamePattern` value is a fully anchored regex
+  built from the installed Vitest's suite separator (`>` from Vitest 5, a space
+  before that). Directory runs use a path filter that ends in a separator, so
+  `src` cannot also match `src2`.
+- **Parameterised tests.** Titles from `test.each`, `describe.each`, `.for` and
+  template literals are marked `is_parameterized`. Their placeholders turn into
+  wildcards, so one Neotest position runs every generated case. The position takes
+  the worst status of those cases.
+- **Truthful results.** Vitest's JSON report decides the result. A test is only
+  marked passed or failed when its own report entry says so. All of the following
+  fail the selection rather than pass it:
+  - a missing, empty, oversized or malformed report;
+  - an unknown status;
+  - a selected test that never ran;
+  - a non-zero exit that no reported failure explains.
+  Reports for sibling files that matched the path filter (`a.test.ts` also matches
+  `a.test.tsx`) are never attributed to the selection.
+- **Debugging.** `strategy = "dap"` launches `pwa-node` (vscode-js-debug) with the
+  following settings:
+  - Vitest's own entrypoint, with source maps, child-process auto-attach and smart
+    stepping;
+  - `--no-file-parallelism`, `--test-timeout=0` and `--hook-timeout=0`, unless you
+    pass your own values;
+  - the debuggee's stdout/stderr sent through DAP output events.
+  js-debug does not send an `exited` event, so for debug runs only Vitest's
+  "unhandled error" banner can turn an all-green report into a failure.
+
+The checks in `tests/` and the end-to-end Neovim + Vitest 1–5 + js-debug harness in
+[Ajaymamtora/dotfiles](https://github.com/Ajaymamtora/dotfiles) back these rules.
+
 ## Known issues
 
-- test.each is currently not well supported (WIP)
+- `it.todo("title")` without a callback is not shown as a Neotest position; Vitest
+  reports it as skipped.
+- Vite's SSR transform reads imported bindings through module accessors. A first
+  debugger *step into* on `add(...)` can stop at the accessor (line 1 of the
+  imported file), and a second step into reaches the function body.
 
 ## How to install it
 
@@ -17,7 +63,7 @@ Credits to [neotest-jest](https://github.com/haydenmeade/neotest-jest)
   "nvim-neotest/neotest",
   dependencies = {
     ...,
-    "marilari88/neotest-vitest",
+    "Ajaymamtora/neotest-vitest",
   },
   config = function()
     require("neotest").setup({
@@ -36,7 +82,7 @@ Credits to [neotest-jest](https://github.com/haydenmeade/neotest-jest)
 {
   "nvim-neotest/neotest",
   dependencies = {
-    "marilari88/neotest-vitest",
+    "Ajaymamtora/neotest-vitest",
   },
   opts = {
     adapters = {
@@ -54,7 +100,7 @@ use({
   "nvim-neotest/neotest",
   requires = {
     ...,
-    "marilari88/neotest-vitest",
+    "Ajaymamtora/neotest-vitest",
   }
   config = function()
     require("neotest").setup({
@@ -80,7 +126,7 @@ Make sure you have Treesitter installed with the right language parser installed
   "nvim-neotest/neotest",
   dependencies = {
     ...,
-    "marilari88/neotest-vitest",
+    "Ajaymamtora/neotest-vitest",
   },
   config = function()
     require("neotest").setup({
